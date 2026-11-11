@@ -323,3 +323,279 @@ gcloud run deploy leadflow-service \
 ```
 
 Once deployment completes, the terminal will provide the live HTTPS production URL.
+
+
+
+
+# Processly (LeadFlow-ADK) — Version 2 Complete Setup & Deployment Runbook
+
+This document contains the complete, consolidated end-to-end instructions, scripts, and commands to configure, containerize, and deploy Processly to Google Cloud Run with Google Sheets integration and zero-to-five autoscaling.
+
+---
+
+## 1. Project Directory Layout
+
+Ensure your project structure resembles the following:
+
+```text
+leadflow-adk/
+├── .dockerignore
+├── .env
+├── .gitignore
+├── Dockerfile
+├── deploy.sh
+├── main.py
+├── requirements.txt
+├── service-account.json
+└── static/
+    └── index.html
+```
+
+---
+
+## 2. Dependencies & Environment Configuration
+
+### Install & Freeze Dependencies
+Activate your virtual environment and install the required Google Auth and Sheets packages:
+
+```bash
+# Navigate to project root
+cd ~/startup/leadflow-adk
+
+# Activate virtual environment
+source .venv/bin/activate
+
+# Install Google Sheets and Authentication libraries
+pip install gspread google-auth
+
+# Freeze requirements
+pip freeze > requirements.txt
+```
+
+### Configure Local Environment (`.env`)
+Store local service account and sheet settings:
+
+```bash
+cat << 'EOF' >> .env
+GOOGLE_APPLICATION_CREDENTIALS="/home/ananta/startup/leadflow-adk/service-account.json"
+GOOGLE_SHEET_NAME="SimpleFlow Leads"
+EOF
+```
+
+### Git Credentials Protection (`.gitignore`)
+Ensure credentials, virtual environments, and data caches are ignored by Git:
+
+```bash
+cat << 'EOF' >> .gitignore
+
+# Service account credentials and environment configurations
+service-account.json
+*.json
+!data/inquiries.json.example
+.env
+.venv
+venv
+__pycache__/
+*.log
+EOF
+```
+
+---
+
+## 3. Site Rebranding (SimpleFlow → Processly)
+
+Update UI templates and FastAPI application metadata:
+
+```bash
+# Update HTML frontend
+sed -i 's/SimpleFlow Automation/Processly/g' static/index.html
+sed -i 's/SimpleFlow/Processly/g' static/index.html
+
+# Update FastAPI metadata in main.py
+sed -i 's/FastAPI(title="SimpleFlow API")/FastAPI(title="Processly API")/g' main.py
+sed -i 's/FastAPI(title="SimpleFlow Automation")/FastAPI(title="Processly API")/g' main.py
+```
+
+---
+
+## 4. Containerization Files
+
+### Create `Dockerfile`
+A clean Debian Python 3.11-slim container for Cloud Run:
+
+```bash
+cat << 'EOF' > Dockerfile
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PORT=8080
+
+WORKDIR /app
+
+# Copy dependency requirements first for build caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application source code and static assets
+COPY . .
+
+EXPOSE 8080
+
+# Cloud Run passes $PORT at runtime
+CMD exec uvicorn main:app --host 0.0.0.0 --port ${PORT}
+EOF
+```
+
+### Create `.dockerignore`
+Exclude local artifacts, keys, and environments from container image layers:
+
+```bash
+cat << 'EOF' > .dockerignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+*.env
+service-account.json
+*.json
+!data/inquiries.json.example
+data/inquiries.json
+*.log
+EOF
+```
+
+---
+
+## 5. Automated Deployment Script (`deploy.sh`)
+
+This script handles:
+1. Setting active `gcloud` account and project automatically.
+2. Enabling required Cloud APIs (`run.googleapis.com`, `cloudbuild.googleapis.com`, `artifactregistry.googleapis.com`).
+3. Attaching the service account for Google Sheets runtime authorization.
+4. Setting autoscaling limits (`--min-instances=0`, `--max-instances=5`).
+
+```bash
+cat << 'EOF' > deploy.sh
+#!/usr/bin/env bash
+set -e
+
+echo "=========================================="
+echo "🚀 Starting Processly Cloud Run Deployment"
+echo "=========================================="
+
+# 1. Target Account & Project Settings
+GCP_ACCOUNT="anantarala@gmail.com"
+PROJECT_ID="leadflow-513314"
+REGION="us-central1"
+SERVICE_NAME="leadflow-service"
+SHEET_NAME="${GOOGLE_SHEET_NAME:-SimpleFlow Leads}"
+
+# 2. Switch Active gcloud Profile
+echo "Switching gcloud context..."
+gcloud config set account "$GCP_ACCOUNT"
+gcloud config set project "$PROJECT_ID"
+
+echo "✓ Active Account: $(gcloud config get-value account)"
+echo "✓ Active Project: $(gcloud config get-value project)"
+
+# 3. Read API Key from .env
+if [ -z "$GOOGLE_API_KEY" ]; then
+    if [ -f ".env" ]; then
+        GOOGLE_API_KEY=$(grep -E '^GOOGLE_API_KEY=' .env | head -n 1 | cut -d '=' -f2- | tr -d '"' | tr -d "'")
+    elif [ -f "leadflow_agent/.env" ]; then
+        GOOGLE_API_KEY=$(grep -E '^GOOGLE_API_KEY=' leadflow_agent/.env | head -n 1 | cut -d '=' -f2- | tr -d '"' | tr -d "'")
+    fi
+fi
+
+if [ -z "$GOOGLE_API_KEY" ]; then
+    echo "❌ Error: GOOGLE_API_KEY not found in environment or .env file."
+    exit 1
+fi
+echo "✓ Gemini API Key loaded."
+
+# 4. Extract Service Account Email from service-account.json
+if [ -f "service-account.json" ]; then
+    SA_EMAIL=$(grep -o '"client_email"[^,]*' service-account.json | cut -d '"' -f 4)
+    echo "✓ Detected Service Account: $SA_EMAIL"
+else
+    echo "⚠️  service-account.json not found in root. Proceeding with default compute identity."
+fi
+
+# 5. Enable Required Cloud APIs
+echo "⏳ Ensuring required Google Cloud APIs are enabled..."
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com
+
+# 6. Assemble Deployment Parameters
+DEPLOY_FLAGS=(
+    "--source=."
+    "--region=$REGION"
+    "--platform=managed"
+    "--allow-unauthenticated"
+    "--min-instances=0"
+    "--max-instances=5"
+    "--set-env-vars=GOOGLE_API_KEY=$GOOGLE_API_KEY,GOOGLE_SHEET_NAME=$SHEET_NAME"
+)
+
+if [ -n "$SA_EMAIL" ]; then
+    DEPLOY_FLAGS+=("--service-account=$SA_EMAIL")
+fi
+
+# 7. Build and Deploy
+echo "📦 Building container and deploying to Cloud Run ($SERVICE_NAME)..."
+gcloud run deploy "$SERVICE_NAME" "${DEPLOY_FLAGS[@]}"
+
+echo "=========================================="
+echo "🎉 Deployment Complete!"
+echo "=========================================="
+EOF
+
+chmod +x deploy.sh
+```
+
+---
+
+## 6. Execution, Verification & Log Streaming
+
+### 1. Execute Deployment
+Deploy directly to Cloud Run:
+
+```bash
+./deploy.sh
+```
+
+### 2. Verify Autoscaling Bounds (Min: 0, Max: 5)
+Verify that the runtime scale settings are active on Cloud Run:
+
+```bash
+gcloud run services describe leadflow-service \
+  --region=us-central1 \
+  --format="yaml(spec.template.metadata.annotations)"
+```
+
+Look for:
+```yaml
+autoscaling.knative.dev/minScale: '0'
+autoscaling.knative.dev/maxScale: '5'
+```
+
+### 3. Monitor Real-Time Request & Container Logs
+Stream live incoming inquiries and container events:
+
+```bash
+gcloud beta run services logs tail leadflow-service --region us-central1
+```
+
+---
+
+## 7. Git Version Tagging
+
+Stage all modified files, commit them, and tag Version 2:
+
+```bash
+git add main.py static/index.html Dockerfile .dockerignore deploy.sh .gitignore requirements.txt
+git commit -m "feat: complete Processly rebrand, containerization, and Cloud Run deployment with autoscaling"
+git tag -a v2.1.0 -m "Release v2.1.0: Cloud Run live with 0-5 autoscaling and Google Sheets synchronization"
+```
